@@ -79,7 +79,7 @@ int Locator::genInitialParticles(int num)
     auto [xmin, xmax, ymin, ymax, thetamin, thetamax] = constraints;
     hypos.col(0) = hypos.col(0) * (xmax - xmin) / 2 + (xmin + xmax) / 2;
     hypos.col(1) = hypos.col(1) * (ymax - ymin) / 2 + (ymin + ymax) / 2;
-    hypos.col(2) = hypos.col(2) * (thetamax - thetamin) / 2 + (thetamin + thetamax) / 2;
+    hypos.col(2) = hypos.col(2) * (thetamax - thetamin) / 2 + (thetamin + thetamin) / 2;
 
     return 0;
 }
@@ -202,50 +202,6 @@ Pose2D Locator::finalAdjust(vector<FieldMarker> markers_r, Pose2D pose)
     return Pose2D{pose.x + dx, pose.y + dy, pose.theta};
 }
 
-int Locator::calcProbs(vector<FieldMarker> markers_r)
-{
-    int rows = hypos.rows();
-    if (rows < 1)
-        return 1;
-
-    for (int i = 0; i < rows; i++)
-    {
-        Pose2D pose{hypos(i, 0), hypos(i, 1), hypos(i, 2)};
-        double res = residual(markers_r, pose);
-        hypos(i, 3) = res;
-
-        if (res < bestResidual)
-        {
-            bestResidual = res;
-            bestPose = pose;
-        }
-    }
-
-    double mean = hypos.col(3).mean();
-    double sqSum = ((hypos.col(3) - mean).square().sum());
-    double sigma = std::sqrt(sqSum / (rows - 1));
-    double mu = hypos.col(3).minCoeff() - muOffset * sigma;
-
-    for (int i = 0; i < rows; i++)
-    {
-        hypos(i, 4) = probDesity(hypos(i, 3), mu, sigma);
-    }
-
-    double probSum = hypos.col(4).sum();
-    if (fabs(probSum) < 1e-5)
-        return 1;
-
-    hypos.col(4) = hypos.col(4) / probSum;
-
-    double acc = 0;
-    for (int i = 0; i < rows; i++)
-    {
-        acc += hypos(i, 4);
-        hypos(i, 5) = acc;
-    }
-
-    return 0;
-}
 
 bool Locator::isConverged()
 {
@@ -366,4 +322,62 @@ LocateResult Locator::locateRobot(vector<FieldMarker> markers_r, PoseBox2D const
     res.code = 3;
     res.msecs = msecsSince(start_time);
     return res;
+}
+
+int Locator::calcProbs(vector<FieldMarker> markers_r)
+{
+    int rows = hypos.rows();
+    if (rows < 1)
+        return 1;
+
+    // 获取当前IMU方向（来自融合后的里程计/IMU数据）
+    double imuTheta = brain->data->robotPoseToField.theta;
+    double sigma_theta = 0.1; // 表示IMU方向噪声水平，可调参数
+
+    // 计算每个粒子的残差，并更新最佳位姿
+    for (int i = 0; i < rows; i++)
+    {
+        Pose2D pose{hypos(i, 0), hypos(i, 1), hypos(i, 2)};
+        double res = residual(markers_r, pose);
+        hypos(i, 3) = res;
+        if (res < bestResidual)
+        {
+            bestResidual = res;
+            bestPose = pose;
+        }
+    }
+
+    double mean = hypos.col(3).mean();
+    double sqSum = ((hypos.col(3) - mean).square().sum());
+    double sigma = std::sqrt(sqSum / (rows - 1));
+    double mu = hypos.col(3).minCoeff() - muOffset * sigma;
+
+    // 根据残差计算概率，同时融合IMU方向信息
+    for (int i = 0; i < rows; i++)
+    {
+        double baseProb = probDesity(hypos(i, 3), mu, sigma);
+
+        // 计算当前粒子方向与IMU方向之间的差异
+        double theta_particle = hypos(i, 2);
+        double theta_diff = fabs(toPInPI(theta_particle - imuTheta));
+        double theta_weight = exp(- (theta_diff * theta_diff) / (2 * sigma_theta * sigma_theta)) /
+                               (sqrt(2 * M_PI) * sigma_theta);
+
+        hypos(i, 4) = baseProb * theta_weight;
+    }
+
+    double probSum = hypos.col(4).sum();
+    if (fabs(probSum) < 1e-5)
+        return 1;
+
+    hypos.col(4) = hypos.col(4) / probSum;
+
+    double acc = 0;
+    for (int i = 0; i < rows; i++)
+    {
+        acc += hypos(i, 4);
+        hypos(i, 5) = acc;
+    }
+
+    return 0;
 }
